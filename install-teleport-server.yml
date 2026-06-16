@@ -1,0 +1,183 @@
+---
+- name: Install and configure Teleport Control Plane
+  hosts: teleport_server
+  become: true
+  gather_facts: true
+
+
+  vars:
+    teleport_arch: "amd64"
+    teleport_platform: "linux"
+
+    teleport_archive: >
+      teleport-v{{ teleport_version }}-{{ teleport_platform }}-{{ teleport_arch }}-bin.tar.gz
+
+    teleport_download_url: >
+      https://cdn.teleport.dev/{{ teleport_archive }}
+
+    teleport_install_dir: "/tmp/teleport-install"
+
+
+  pre_tasks:
+
+    - name: Validate operating system
+      ansible.builtin.assert:
+        that:
+          - ansible_os_family == "Debian"
+        fail_msg: "Only Debian/Ubuntu systems are supported."
+
+
+    - name: Install required packages
+      ansible.builtin.apt:
+        name:
+          - curl
+          - tar
+          - gzip
+          - ca-certificates
+        state: present
+        update_cache: true
+
+
+  tasks:
+
+    ################################################
+    # Download and install Teleport binaries
+    ################################################
+
+    - name: Create temporary directory
+      ansible.builtin.file:
+        path: "{{ teleport_install_dir }}"
+        state: directory
+        mode: "0755"
+
+
+    - name: Download Teleport archive
+      ansible.builtin.get_url:
+        url: "{{ teleport_download_url }}"
+        dest: "/tmp/{{ teleport_archive }}"
+        mode: "0644"
+
+
+    - name: Extract Teleport package
+      ansible.builtin.unarchive:
+        src: "/tmp/{{ teleport_archive }}"
+        dest: "{{ teleport_install_dir }}"
+        remote_src: true
+        extra_opts:
+          - --strip-components=1
+
+
+    - name: Install Teleport binaries
+      ansible.builtin.copy:
+        src: "{{ teleport_install_dir }}/{{ item }}"
+        dest: "/usr/local/bin/{{ item }}"
+        mode: "0755"
+        remote_src: true
+      loop:
+        - teleport
+        - tsh
+        - tctl
+
+
+    ################################################
+    # Prepare directories
+    ################################################
+
+    - name: Create Teleport data directory
+      ansible.builtin.file:
+        path: /var/lib/teleport
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+
+    ################################################
+    # Configuration
+    ################################################
+
+    - name: Deploy Teleport configuration
+      ansible.builtin.template:
+        src: ../templates/teleport-server.yaml.j2
+        dest: /etc/teleport.yaml
+        owner: root
+        group: root
+        mode: "0600"
+      notify:
+        - restart teleport
+
+
+    - name: Deploy systemd service
+      ansible.builtin.template:
+        src: ../templates/teleport.service.j2
+        dest: /etc/systemd/system/teleport.service
+        owner: root
+        group: root
+        mode: "0644"
+      notify:
+        - reload systemd
+        - restart teleport
+
+
+    ################################################
+    # Start service
+    ################################################
+
+    - name: Flush handlers immediately
+      ansible.builtin.meta: flush_handlers
+
+
+    - name: Enable and start Teleport
+      ansible.builtin.systemd:
+        name: teleport
+        enabled: true
+        state: started
+
+
+    ################################################
+    # Health checks
+    ################################################
+
+    - name: Wait for Teleport HTTPS endpoint
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 443
+        timeout: 60
+
+
+    - name: Check Teleport Web API
+      ansible.builtin.uri:
+        url: https://127.0.0.1/webapi/ping
+        validate_certs: false
+        return_content: true
+      register: teleport_api
+
+
+    - name: Show Teleport cluster information
+      ansible.builtin.debug:
+        var: teleport_api.json
+
+
+    - name: Verify Teleport version
+      ansible.builtin.command:
+        cmd: teleport version
+      register: teleport_version_output
+      changed_when: false
+
+
+    - name: Display installed version
+      ansible.builtin.debug:
+        var: teleport_version_output.stdout
+
+
+  handlers:
+
+    - name: reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+
+    - name: restart teleport
+      ansible.builtin.systemd:
+        name: teleport
+        state: restarted
