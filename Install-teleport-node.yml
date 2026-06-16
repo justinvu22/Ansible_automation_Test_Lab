@@ -1,0 +1,250 @@
+---
+# install-teleport-node.yml
+#
+# Purpose:
+#   Install and configure Teleport SSH nodes (agents) for TO5.
+#
+# Intended hosts:
+#   - nginx01
+#   - nginx02
+#   - nginx03
+#   - haproxy01
+#   - haproxy02
+#   - dns01
+#   - ansible01
+#   - prom01 (only if you want prom01 to be joinable via Teleport)
+#
+# What this playbook does:
+#   - Installs Teleport binaries
+#   - Creates /var/lib/teleport
+#   - Writes a minimal node config
+#   - Registers the node to teleport01 using a join token
+#   - Enables and starts the Teleport service
+#   - Verifies that the node is listening on port 3022 and healthy
+#
+# Important design notes:
+#   - This playbook does NOT install Tailscale.
+#   - This playbook does NOT enable proxy_service or auth_service.
+#   - This playbook assumes the control plane is already running on teleport01.
+#   - The join token must be generated on teleport01 before you run this playbook.
+#   - For a clean rebuild, keep the token in a variable or pass it at runtime.
+#
+# Usage example:
+#   ansible-playbook -i inventory/hosts.ini playbooks/install-teleport-node.yml \
+#     --extra-vars "teleport_join_token=xxxxxxxxxxxxxxxx"
+- name: Install and configure Teleport node agents
+  hosts: teleport_nodes
+  become: true
+  gather_facts: true
+
+  vars:
+    # Keep this aligned with the control plane version.
+    teleport_version: "14.4.1"
+
+    teleport_platform: "linux"
+    teleport_arch: "amd64"
+
+    teleport_cluster_name: "to5-lab"
+    teleport_nodename: "{{ inventory_hostname }}"
+
+    # The node must be able to reach the Auth server over the LAN.
+    teleport_auth_server: "192.168.100.68:3025"
+
+    # The join token should be provided per run or via group_vars/host_vars.
+    # Example: sudo tctl tokens add --type=node
+    teleport_join_token: "{{ lookup('env', 'TELEPORT_JOIN_TOKEN') | default('', true) }}"
+
+    teleport_tarball: "teleport-v{{ teleport_version }}-{{ teleport_platform }}-{{ teleport_arch }}-bin.tar.gz"
+    teleport_url: "https://cdn.teleport.dev/{{ teleport_tarball }}"
+
+    teleport_install_dir: "/tmp/teleport-install"
+    teleport_data_dir: "/var/lib/teleport"
+    teleport_config_file: "/etc/teleport.yaml"
+    teleport_systemd_unit: "/etc/systemd/system/teleport.service"
+
+    teleport_base_packages:
+      - ca-certificates
+      - curl
+      - tar
+      - gzip
+
+  pre_tasks:
+    - name: Ensure join token is provided
+      ansible.builtin.assert:
+        that:
+          - teleport_join_token is defined
+          - teleport_join_token | length > 0
+        fail_msg: >-
+          teleport_join_token is required to join a fresh node to the cluster.
+          Generate one on teleport01 with:
+          sudo tctl tokens add --type=node
+          Then pass it via --extra-vars or TELEPORT_JOIN_TOKEN env var.
+
+    - name: Ensure this is a Debian-based host
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.os_family == "Debian"
+        fail_msg: >-
+          This playbook is written for Debian/Ubuntu hosts only.
+          Detected os_family={{ ansible_facts.os_family }} on {{ inventory_hostname }}.
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install base packages required for Teleport install
+      ansible.builtin.apt:
+        name: "{{ teleport_base_packages }}"
+        state: present
+
+  tasks:
+    - name: Create temporary install directory
+      ansible.builtin.file:
+        path: "{{ teleport_install_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Download Teleport release tarball
+      ansible.builtin.get_url:
+        url: "{{ teleport_url }}"
+        dest: "/tmp/{{ teleport_tarball }}"
+        mode: "0644"
+
+    - name: Extract Teleport release tarball
+      ansible.builtin.command:
+        cmd: >-
+          tar -xzf /tmp/{{ teleport_tarball }}
+          -C {{ teleport_install_dir }}
+          --strip-components=1
+      args:
+        creates: "{{ teleport_install_dir }}/teleport"
+    - name: Install Teleport binaries
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        remote_src: true
+        mode: "{{ item.mode }}"
+      loop:
+        - { src: "{{ teleport_install_dir }}/teleport", dest: "/usr/local/bin/teleport", mode: "0755" }
+        - { src: "{{ teleport_install_dir }}/tsh", dest: "/usr/local/bin/tsh", mode: "0755" }
+        - { src: "{{ teleport_install_dir }}/tctl", dest: "/usr/local/bin/tctl", mode: "0755" }
+
+    - name: Create Teleport runtime directory
+      ansible.builtin.file:
+        path: "{{ teleport_data_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Create Teleport log directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - "{{ teleport_data_dir }}/log"
+        - "{{ teleport_data_dir }}/log/upload"
+        - "{{ teleport_data_dir }}/log/upload/streaming"
+        - "{{ teleport_data_dir }}/log/upload/corrupted"
+
+    - name: Write Teleport node configuration
+      ansible.builtin.copy:
+        dest: "{{ teleport_config_file }}"
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          version: v3
+
+          teleport:
+            nodename: {{ teleport_nodename }}
+            data_dir: {{ teleport_data_dir }}
+
+            join_params:
+              method: token
+              token_name: {{ teleport_join_token }}
+
+            auth_server: {{ teleport_auth_server }}
+
+          ssh_service:
+            enabled: yes
+            listen_addr: 0.0.0.0:3022
+
+          auth_service:
+            enabled: no
+
+          proxy_service:
+            enabled: no
+      notify:
+        - restart teleport
+    - name: Write Teleport systemd unit
+      ansible.builtin.copy:
+        dest: "{{ teleport_systemd_unit }}"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Teleport Service
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          Type=simple
+          ExecStart=/usr/local/bin/teleport start --config={{ teleport_config_file }} --pid-file=/run/teleport.pid
+          Restart=on-failure
+          RestartSec=5
+          LimitNOFILE=524288
+
+          [Install]
+          WantedBy=multi-user.target
+      notify:
+        - reload systemd
+        - restart teleport
+
+    - name: Enable Teleport service
+      ansible.builtin.systemd:
+        name: teleport
+        enabled: true
+
+    - name: Start Teleport service
+      ansible.builtin.systemd:
+        name: teleport
+        state: started
+
+    - name: Wait for SSH service port locally
+      ansible.builtin.wait_for:
+        port: 3022
+        host: 127.0.0.1
+        timeout: 60
+
+    - name: Check Teleport service status
+      ansible.builtin.command:
+        cmd: systemctl is-active teleport
+      register: teleport_service_status
+      changed_when: false
+      failed_when: teleport_service_status.stdout.strip() != "active"
+
+    - name: Verify Teleport binary version
+      ansible.builtin.command:
+        cmd: teleport version
+      register: teleport_version_output
+      changed_when: false
+
+    - name: Print Teleport version
+      ansible.builtin.debug:
+        var: teleport_version_output.stdout
+
+  handlers:
+    - name: reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: restart teleport
+      ansible.builtin.systemd:
+        name: teleport
+        state: restarted
