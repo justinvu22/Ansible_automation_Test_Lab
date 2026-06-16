@@ -1,163 +1,102 @@
 ---
-# bootstrap-common.yml
-#
-# Purpose:
-#   Establish a clean, repeatable baseline on fresh Ubuntu/Debian VMs.
-#
-# What this playbook does:
-#   - Ensures Python 3 exists so Ansible modules can run reliably
-#   - Updates apt cache and performs a safe upgrade
-#   - Installs common admin utilities
-#   - Sets timezone and locale basics
-#   - Configures the hostname (optional)
-#   - Enables qemu-guest-agent when running inside Proxmox
-#   - Ensures key services are enabled and running
-#
-# Notes:
-#   - This playbook is intentionally conservative.
-#   - It does NOT install Teleport, Prometheus, node_exporter, Nginx, or HAProxy.
-#   - It is designed to be the first baseline step before service-specific roles.
-
-- name: Bootstrap common baseline on Ubuntu/Debian VMs
+- name: Bootstrap common Linux configuration
   hosts: all
   become: true
-  gather_facts: false
+  gather_facts: true
 
   vars:
-    # If you want to standardize timezone across the lab, change this once.
-    bootstrap_timezone: "Asia/Ho_Chi_Minh"
-
-    # Common baseline packages for administration and troubleshooting.
-    bootstrap_packages:
-      - ca-certificates
+    common_packages:
       - curl
       - wget
       - vim
       - nano
-      - git
       - unzip
-      - tar
-      - rsync
-      - jq
+      - zip
+      - git
       - htop
       - net-tools
-      - iproute2
       - dnsutils
+      - ca-certificates
+      - software-properties-common
+      - apt-transport-https
       - chrony
       - qemu-guest-agent
       - python3
-      - python3-apt
       - python3-pip
 
-    # Toggle hostname configuration.
-    # Set to false if you do not want the playbook to change hostnames.
-    bootstrap_set_hostname: true
-
-    # If bootstrap_set_hostname is true, the playbook uses inventory_hostname by default.
-    # You can override this per-host or per-group in inventory/group_vars.
-    bootstrap_hostname: "{{ inventory_hostname }}"
-
-    # Toggle whether the playbook should attempt a safe apt upgrade.
-    bootstrap_upgrade_system: true
-
-    # Toggle whether qemu-guest-agent should be enabled.
-    bootstrap_enable_qemu_guest_agent: true
-
   pre_tasks:
-    - name: Ensure Python 3 is available for Ansible modules
-      raw: |
-        set -e
-        if ! command -v python3 >/dev/null 2>&1; then
-          export DEBIAN_FRONTEND=noninteractive
-          apt-get update -y
-          apt-get install -y python3 python3-apt
-        fi
-      changed_when: false
 
-    - name: Gather facts after Python is present
-      ansible.builtin.setup:
-
-    - name: Confirm operating system family is Debian-based
+    - name: Ensure Debian-based system
       ansible.builtin.assert:
         that:
-          - ansible_facts.os_family == "Debian"
-        fail_msg: >-
-          This baseline playbook is written for Debian-based systems only.
-          Detected os_family={{ ansible_facts.os_family }} on {{ inventory_hostname }}.
-
-  tasks:
-    - name: Set timezone
-      community.general.timezone:
-        name: "{{ bootstrap_timezone }}"
-      when: bootstrap_timezone is defined and bootstrap_timezone | length > 0
+          - ansible_os_family == "Debian"
+        fail_msg: >
+          This playbook only supports Debian/Ubuntu.
+        success_msg: >
+          Debian based OS detected.
 
     - name: Update apt cache
       ansible.builtin.apt:
         update_cache: true
         cache_valid_time: 3600
 
-    - name: Upgrade system packages safely
-      ansible.builtin.apt:
-        upgrade: safe
-      when: bootstrap_upgrade_system | bool
 
-    - name: Install common baseline packages
+  tasks:
+
+    - name: Upgrade system packages
       ansible.builtin.apt:
-        name: "{{ bootstrap_packages }}"
+        upgrade: dist
+
+
+    - name: Install common packages
+      ansible.builtin.apt:
+        name: "{{ common_packages }}"
         state: present
 
-    - name: Ensure chrony is enabled and running
-      ansible.builtin.service:
+
+    - name: Configure timezone
+      ansible.builtin.command:
+        cmd: timedatectl set-timezone {{ timezone }}
+      changed_when: false
+
+
+    - name: Enable and start chrony
+      ansible.builtin.systemd:
         name: chrony
         enabled: true
         state: started
-      ignore_errors: true
 
-    - name: Ensure qemu-guest-agent is enabled and running
-      ansible.builtin.service:
+
+    - name: Enable qemu guest agent
+      ansible.builtin.systemd:
         name: qemu-guest-agent
         enabled: true
         state: started
-      when: bootstrap_enable_qemu_guest_agent | bool
-      ignore_errors: true
 
-    - name: Set hostname
-      ansible.builtin.hostname:
-        name: "{{ bootstrap_hostname }}"
-      when: bootstrap_set_hostname | bool
 
-    - name: Ensure /etc/hosts contains hostname mapping for localhost
-      ansible.builtin.lineinfile:
-        path: /etc/hosts
-        regexp: '^127\.0\.1\.1\s+'
-        line: "127.0.1.1 {{ bootstrap_hostname }}"
-        state: present
-        create: false
-      when: bootstrap_set_hostname | bool
+    - name: Ensure SSH service enabled
+      ansible.builtin.systemd:
+        name: ssh
+        enabled: true
+        state: started
 
-    - name: Create a helper directory for future automation artifacts
+
+    - name: Create admin maintenance directory
       ansible.builtin.file:
-        path: /opt/to5
+        path: /opt/admin
         state: directory
+        owner: root
+        group: root
         mode: "0755"
 
-    - name: Write a bootstrap marker file
+
+    - name: Create bootstrap marker
       ansible.builtin.copy:
-        dest: /opt/to5/bootstrap-common.completed
-        mode: "0644"
         content: |
-          Bootstrap completed successfully on {{ ansible_date_time.iso8601 }}
-          Hostname: {{ bootstrap_hostname }}
-          Timezone: {{ bootstrap_timezone }}
-          Managed by: bootstrap-common.yml
-
-  handlers:
-    - name: Restart chrony
-      ansible.builtin.service:
-        name: chrony
-        state: restarted
-
-    - name: Restart qemu-guest-agent
-      ansible.builtin.service:
-        name: qemu-guest-agent
-        state: restarted
+          TO5 Infrastructure Bootstrap Complete
+          Managed by Ansible
+          Date: {{ ansible_date_time.iso8601 }}
+        dest: /opt/admin/bootstrap.info
+        owner: root
+        group: root
+        mode: "0644"
